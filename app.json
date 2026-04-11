@@ -3,11 +3,9 @@
     "name": "Blind Street India",
     "slug": "blind-street-india",
     "version": "1.0.0",
-    "orientation": "landscape",
+    "orientation": "portrait",
     "scheme": "blindstreetindia",
-    "platforms": [
-      "android"
-    ],
+    "platforms": ["android"],
     "android": {
       "package": "com.vn463.blindstreetindia",
       "versionCode": 1,
@@ -15,23 +13,13 @@
         "foregroundImage": "./assets/icon-foreground.png",
         "backgroundColor": "#0c0c0e"
       },
-      "permissions": [
-        "android.permission.INTERNET"
-      ]
+      "permissions": ["android.permission.INTERNET"]
     },
     "plugins": [
       "expo-router"
     ],
     "experiments": {
       "typedRoutes": true
-    },
-    "extra": {
-      "router": {
-        "origin": false
-      },
-      "eas": {
-        "projectId": "079e34c5-c8d6-4c7d-8c8d-547a2513461c"
-      }
     }
   }
 }
