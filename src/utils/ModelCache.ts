@@ -1,19 +1,16 @@
 // src/utils/ModelCache.ts
 //
-// ROOT CAUSE (confirmed from Three.js r166 source):
-//   GLTFLoader.parse() calls `new TextDecoder()` on its first line → crashes in Hermes.
-//   GLTFBinaryExtension constructor also calls `new TextDecoder()` → same crash.
+// CONFIRMED ROOT CAUSE (from Three.js r166 source line 323):
+//   GLTFLoader.parse() does `const textDecoder = new TextDecoder()` as its FIRST LINE,
+//   before any data-type checks. Passing an ArrayBuffer OR a plain object — doesn't matter.
+//   TextDecoder is undefined in Hermes → ReferenceError → onError called → null returned.
+//   Every previous attempt failed for this reason.
 //
-// SOLUTION:
-//   1. Parse GLB binary ourselves with pure-JS (no TextDecoder)
-//   2. Strip texture references from JSON (prevents URL.createObjectURL crash)
-//   3. Pre-populate THREE.Cache with the binary body under a unique key
-//   4. Set buffer[0].uri to that cache key in the JSON
-//   5. Call loader.parse(jsonObject) — passes the `else` branch (json = data),
-//      bypassing ALL TextDecoder calls
-//   6. THREE.FileLoader finds the body in Cache immediately, no network request
-//
-// Verified: all 13 GLBs parse correctly with this approach.
+// COMPLETE SOLUTION:
+//   1. Polyfill global.TextDecoder with pure-JS UTF-8 implementation
+//   2. Strip images/textures/samplers from GLB JSON (prevents URL.createObjectURL crash)
+//   3. Pre-populate THREE.Cache with binary body, set buffer[0].uri = cache key
+//   4. Call loader.parse(cleanBuffer) normally — now works end-to-end
 
 import { Asset } from 'expo-asset';
 import * as FileSystem from 'expo-file-system';
@@ -21,7 +18,55 @@ import * as THREE from 'three';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader';
 import { MODEL_ASSETS } from './modelAssets';
 
-// ── Pure-JS base64 → ArrayBuffer ──────────────────────────────────────────────
+// ── Step 1: Polyfill TextDecoder for Hermes ────────────────────────────────────
+// Must run before any import that uses Three.js GLTFLoader.
+// The expo source code comment says: "TextEncoder is in Hermes" — but NOT TextDecoder.
+function installPolyfills() {
+  const g = global as any;
+  if (g.TextDecoder) return; // already available
+
+  g.TextDecoder = class TextDecoder {
+    encoding: string;
+    constructor(label = 'utf-8') { this.encoding = label; }
+
+    decode(input?: ArrayBuffer | ArrayBufferView): string {
+      let bytes: Uint8Array;
+      if (!input) return '';
+      if (input instanceof ArrayBuffer) {
+        bytes = new Uint8Array(input);
+      } else if (ArrayBuffer.isView(input)) {
+        bytes = new Uint8Array(input.buffer, input.byteOffset, input.byteLength);
+      } else {
+        return '';
+      }
+      let str = '';
+      for (let i = 0; i < bytes.length; i++) {
+        const b = bytes[i];
+        if (b < 0x80) {
+          str += String.fromCharCode(b);
+        } else if ((b & 0xE0) === 0xC0 && i + 1 < bytes.length) {
+          str += String.fromCharCode(((b & 0x1F) << 6) | (bytes[++i] & 0x3F));
+        } else if ((b & 0xF0) === 0xE0 && i + 2 < bytes.length) {
+          str += String.fromCharCode(
+            ((b & 0x0F) << 12) | ((bytes[++i] & 0x3F) << 6) | (bytes[++i] & 0x3F)
+          );
+        } else if ((b & 0xF8) === 0xF0 && i + 3 < bytes.length) {
+          const cp = ((b & 0x07) << 18) | ((bytes[++i] & 0x3F) << 12) |
+                     ((bytes[++i] & 0x3F) << 6) | (bytes[++i] & 0x3F);
+          if (cp <= 0xFFFF) {
+            str += String.fromCharCode(cp);
+          } else {
+            const r = cp - 0x10000;
+            str += String.fromCharCode(0xD800 + (r >> 10), 0xDC00 + (r & 0x3FF));
+          }
+        }
+      }
+      return str;
+    }
+  };
+}
+
+// ── Step 2: Base64 → ArrayBuffer ──────────────────────────────────────────────
 function base64ToBuffer(b64: string): ArrayBuffer {
   const clean = b64.replace(/[^A-Za-z0-9+/]/g, '');
   const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
@@ -31,9 +76,9 @@ function base64ToBuffer(b64: string): ArrayBuffer {
   let n = 0;
   for (let i = 0; i < clean.length; i += 4) {
     const a = lut[clean.charCodeAt(i)];
-    const b = lut[clean.charCodeAt(i+1)];
-    const c = lut[clean.charCodeAt(i+2)] ?? 0;
-    const d = lut[clean.charCodeAt(i+3)] ?? 0;
+    const b = lut[clean.charCodeAt(i + 1)];
+    const c = lut[clean.charCodeAt(i + 2)] ?? 0;
+    const d = lut[clean.charCodeAt(i + 3)] ?? 0;
     if (n < out.length) out[n++] = (a << 2) | (b >> 4);
     if (n < out.length) out[n++] = ((b & 15) << 4) | (c >> 2);
     if (n < out.length) out[n++] = ((c & 3) << 6) | d;
@@ -41,58 +86,30 @@ function base64ToBuffer(b64: string): ArrayBuffer {
   return out.buffer;
 }
 
-// ── Pure-JS GLB parser (no TextDecoder at all) ────────────────────────────────
-function parseGLB(buffer: ArrayBuffer): { json: any; body: ArrayBuffer | null } {
+// ── Step 3: Strip textures + inject cache key into GLB binary ─────────────────
+// Returns a new GLB where:
+//   - images/textures/samplers removed from JSON (prevents URL.createObjectURL)
+//   - buffer[0].uri set to cacheKey (so THREE.FileLoader reads from THREE.Cache)
+function processGLB(buffer: ArrayBuffer, cacheKey: string): ArrayBuffer {
   const view = new DataView(buffer);
   if (view.getUint32(0, true) !== 0x46546C67) throw new Error('Not a valid GLB');
 
+  const version  = view.getUint32(4, true);
   const jsonLen  = view.getUint32(12, true);
   const jsonType = view.getUint32(16, true);
-  if (jsonType !== 0x4E4F534A) throw new Error('Expected JSON chunk first');
+  if (jsonType !== 0x4E4F534A) throw new Error('Expected JSON chunk');
 
-  // Decode JSON bytes to string using pure charCode operations — no TextDecoder
-  const jsonBytes = new Uint8Array(buffer, 20, jsonLen);
-  let str = '';
-  for (let i = 0; i < jsonBytes.length; i++) {
-    const b = jsonBytes[i];
-    if (b < 0x80) {
-      str += String.fromCharCode(b);
-    } else if ((b & 0xE0) === 0xC0 && i + 1 < jsonBytes.length) {
-      str += String.fromCharCode(((b & 0x1F) << 6) | (jsonBytes[++i] & 0x3F));
-    } else if ((b & 0xF0) === 0xE0 && i + 2 < jsonBytes.length) {
-      str += String.fromCharCode(((b & 0x0F) << 12) | ((jsonBytes[++i] & 0x3F) << 6) | (jsonBytes[++i] & 0x3F));
-    } else {
-      i += 3;
-    }
-  }
-  const json = JSON.parse(str);
+  // Decode JSON — TextDecoder polyfill is now installed so we can use it here
+  const td = new (global as any).TextDecoder();
+  const jsonStr = td.decode(new Uint8Array(buffer, 20, jsonLen));
+  const json = JSON.parse(jsonStr);
 
-  // Extract BIN chunk body
-  let body: ArrayBuffer | null = null;
-  const binStart = 20 + jsonLen;
-  if (binStart + 8 <= buffer.byteLength) {
-    const binLen  = view.getUint32(binStart, true);
-    const binType = view.getUint32(binStart + 4, true);
-    if (binType === 0x004E4942 && binLen > 0) {
-      body = buffer.slice(binStart + 8, binStart + 8 + binLen);
-    }
-  }
-
-  return { json, body };
-}
-
-// ── Strip texture references from GLTF JSON ───────────────────────────────────
-function stripTextures(json: any, cacheKey: string): any {
-  const j = JSON.parse(JSON.stringify(json)); // deep clone
-
-  // Remove all texture-related data
-  delete j.images;
-  delete j.textures;
-  delete j.samplers;
-
-  // Remove texture references from materials
-  if (Array.isArray(j.materials)) {
-    j.materials.forEach((mat: any) => {
+  // Strip all texture-related data
+  delete json.images;
+  delete json.textures;
+  delete json.samplers;
+  if (Array.isArray(json.materials)) {
+    json.materials.forEach((mat: any) => {
       if (mat.pbrMetallicRoughness) {
         delete mat.pbrMetallicRoughness.baseColorTexture;
         delete mat.pbrMetallicRoughness.metallicRoughnessTexture;
@@ -103,69 +120,106 @@ function stripTextures(json: any, cacheKey: string): any {
     });
   }
 
-  // Point buffer[0] at our THREE.Cache key instead of leaving uri undefined
-  // (uri undefined triggers the KHR_BINARY_GLTF path which needs TextDecoder)
-  if (j.buffers && j.buffers[0] && j.buffers[0].uri === undefined) {
-    j.buffers[0].uri = cacheKey;
+  // Redirect buffer[0] to THREE.Cache key
+  // (GLB buffer[0] normally has no URI — Three.js reads it from KHR_BINARY_GLTF.body.
+  //  Setting a URI makes Three.js use FileLoader instead, which checks THREE.Cache.)
+  if (json.buffers && json.buffers[0]) {
+    json.buffers[0].uri = cacheKey;
   }
 
-  return j;
+  // Re-encode JSON (TextEncoder IS in Hermes natively)
+  const te = new TextEncoder();
+  const newJsonBytes = te.encode(JSON.stringify(json));
+  const padded = Math.ceil(newJsonBytes.length / 4) * 4;
+  const newJsonPadded = new Uint8Array(padded).fill(0x20);
+  newJsonPadded.set(newJsonBytes);
+
+  // Extract BIN chunk
+  const binStart = 20 + jsonLen;
+  let binChunk: Uint8Array | null = null;
+  if (binStart + 8 <= buffer.byteLength) {
+    const binLen  = view.getUint32(binStart, true);
+    const binType = view.getUint32(binStart + 4, true);
+    if (binType === 0x004E4942 && binLen > 0) {
+      binChunk = new Uint8Array(buffer, binStart, 8 + binLen);
+    }
+  }
+
+  // Rebuild GLB
+  const totalLen = 12 + 8 + padded + (binChunk ? binChunk.length : 0);
+  const out = new ArrayBuffer(totalLen);
+  const outView = new DataView(out);
+  const outBytes = new Uint8Array(out);
+
+  outView.setUint32(0, 0x46546C67, true);
+  outView.setUint32(4, version, true);
+  outView.setUint32(8, totalLen, true);
+  outView.setUint32(12, padded, true);
+  outView.setUint32(16, 0x4E4F534A, true);
+  outBytes.set(newJsonPadded, 20);
+  if (binChunk) outBytes.set(binChunk, 20 + padded);
+
+  return out;
 }
 
-// ── Load a single GLB from bundle ─────────────────────────────────────────────
+// ── Step 4: Load single model ──────────────────────────────────────────────────
 async function loadGLB(modelKey: string): Promise<THREE.Group> {
+  installPolyfills(); // must be before any GLTFLoader usage
+
   const assetModule = MODEL_ASSETS[modelKey];
   if (!assetModule) throw new Error(`No asset: ${modelKey}`);
 
   const [asset] = await Asset.loadAsync(assetModule);
   const uri = asset.localUri ?? asset.uri;
-  if (!uri) throw new Error(`No URI for: ${modelKey}`);
+  if (!uri) throw new Error(`No URI: ${modelKey}`);
 
   const b64 = await FileSystem.readAsStringAsync(uri, {
     encoding: FileSystem.EncodingType.Base64,
   });
   if (!b64 || b64.length === 0) throw new Error(`Empty file: ${modelKey}`);
 
-  const buffer      = base64ToBuffer(b64);
-  const { json, body } = parseGLB(buffer);
+  const rawBuffer = base64ToBuffer(b64);
 
-  // Unique cache key for this model's binary body
-  const cacheKey = `bsi_model_${modelKey}_body`;
-
-  // Pre-populate THREE.Cache with the binary body.
-  // THREE.FileLoader checks Cache first — returns immediately without network request.
-  if (body) {
-    THREE.Cache.enabled = true;
-    THREE.Cache.add(cacheKey, body);
+  // Extract binary body for THREE.Cache
+  const rawView = new DataView(rawBuffer);
+  const jsonLen = rawView.getUint32(12, true);
+  const binStart = 20 + jsonLen;
+  let body: ArrayBuffer | null = null;
+  if (binStart + 8 <= rawBuffer.byteLength) {
+    const binLen  = rawView.getUint32(binStart, true);
+    const binType = rawView.getUint32(binStart + 4, true);
+    if (binType === 0x004E4942 && binLen > 0) {
+      body = rawBuffer.slice(binStart + 8, binStart + 8 + binLen);
+    }
   }
 
-  // Strip textures and redirect buffer[0] URI to our cache key
-  const cleanJson = stripTextures(json, cacheKey);
+  // Pre-populate THREE.Cache with the binary body
+  const cacheKey = `bsi_${modelKey}`;
+  THREE.Cache.enabled = true;
+  if (body) THREE.Cache.add(cacheKey, body);
 
-  console.log(`[ModelCache] Parsing ${modelKey}: meshes=${cleanJson.meshes?.length ?? 0}`);
+  // Process GLB: strip textures, redirect buffer URI to cache key
+  const cleanBuffer = processGLB(rawBuffer, cacheKey);
 
-  // Parse by passing the plain JS object.
-  // Three.js parse() checks: instanceof ArrayBuffer → binary path (TextDecoder)
-  //                          else → json = data  ← WE TAKE THIS PATH
-  // No TextDecoder is used. Buffer[0] is resolved from THREE.Cache.
-  const loader = new GLTFLoader();
-  const gltf = await new Promise<any>((resolve, reject) => {
-    loader.parse(cleanJson, '', resolve, (err: any) => {
-      // Clean up cache entry on error
-      THREE.Cache.remove(cacheKey);
-      reject(err instanceof Error ? err : new Error(String(err)));
+  console.log(`[ModelCache] Parsing ${modelKey}: ${cleanBuffer.byteLength} bytes`);
+
+  try {
+    const loader = new GLTFLoader();
+    const gltf = await new Promise<any>((resolve, reject) => {
+      loader.parse(cleanBuffer, '', resolve, (err: any) => {
+        reject(err instanceof Error ? err : new Error(String(err)));
+      });
     });
-  });
 
-  // Clean up cache — no longer needed after parse
-  THREE.Cache.remove(cacheKey);
+    gltf.scene.traverse((child: any) => {
+      if (child.isMesh) { child.castShadow = true; child.receiveShadow = true; }
+    });
 
-  gltf.scene.traverse((child: any) => {
-    if (child.isMesh) { child.castShadow = true; child.receiveShadow = true; }
-  });
-
-  console.log(`[ModelCache] Ready: ${modelKey}`);
-  return gltf.scene;
+    console.log(`[ModelCache] Ready: ${modelKey}`);
+    return gltf.scene;
+  } finally {
+    THREE.Cache.remove(cacheKey);
+  }
 }
 
 // ── Public API ─────────────────────────────────────────────────────────────────
@@ -190,6 +244,7 @@ export async function loadModel(modelKey: string): Promise<THREE.Group | null> {
 export async function preloadAllModels(
   onProgress?: (loaded: number, total: number) => void
 ): Promise<void> {
+  installPolyfills(); // ensure polyfilled before any model loading
   const keys = Object.keys(MODEL_ASSETS);
   let loaded = 0;
   for (const key of keys) {

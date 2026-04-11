@@ -7,7 +7,7 @@ import { GLView } from "expo-gl";
 import * as THREE from "three";
 import * as Haptics from "expo-haptics";
 import { useKeepAwake } from "expo-keep-awake";
-import Joystick from "./Joystick";
+import DualJoystick from "./Joystick";
 import { LEVELS } from "../utils/levels";
 import { loadModel } from "../utils/ModelCache";
 
@@ -15,7 +15,7 @@ import { loadModel } from "../utils/ModelCache";
 const PLAYER_RADIUS     = 12;
 const MOVE_SPEED        = 1.8;
 const ROTATION_SPEED    = 0.045;
-const FOG_DENSITY       = 0.008;
+const FOG_DENSITY       = 0.018;
 const PATH_DRAIN_RATE   = 0.08;
 const PATH_RECOVER_RATE = 0.04;
 const MAX_CONFIDENCE    = 100;
@@ -295,7 +295,7 @@ export default function Game({ levelIndex, onExit, onLevelComplete }: GameProps)
     // ── Scene ──────────────────────────────────────────────────────────────
     const scene = new THREE.Scene();
     scene.background = new THREE.Color(0x1a1a2e);
-    // Fog removed — was hiding all objects beyond 50 units
+    scene.fog = new THREE.FogExp2(0x0f1117, FOG_DENSITY);
 
     // Portrait mode: swap aspect ratio so game fills portrait screen correctly
     const aspect = W > H ? W / H : H / W;
@@ -599,10 +599,12 @@ export default function Game({ levelIndex, onExit, onLevelComplete }: GameProps)
         <View style={S.toast}><Text style={S.toastTxt}>⚠ {message}</Text></View>
       )}
 
-      <View style={S.sticks}>
-        <Joystick label="Move" onMove={d => { moveInputRef.current = d; }} onEnd={() => { moveInputRef.current = { x: 0, y: 0 }; }} />
-        <Joystick label="Look" onMove={d => { stickInputRef.current = d; }} onEnd={() => { stickInputRef.current = { x: 0, y: 0 }; }} />
-      </View>
+      <DualJoystick
+        onMoveLeft={d  => { moveInputRef.current  = d; }}
+        onEndLeft={()  => { moveInputRef.current  = { x: 0, y: 0 }; }}
+        onMoveRight={d => { stickInputRef.current = d; }}
+        onEndRight={() => { stickInputRef.current = { x: 0, y: 0 }; }}
+      />
 
       {gameState === "gameover" && (
         <View style={S.overlay}>
@@ -638,7 +640,7 @@ const S = StyleSheet.create({
   confFill:  { height: "100%", borderRadius: 3 },
   toast:     { position: "absolute", top: "34%", alignSelf: "center", backgroundColor: "#eab308", paddingHorizontal: 20, paddingVertical: 10, borderRadius: 2, zIndex: 40 },
   toastTxt:  { color: "#000", fontWeight: "900", fontSize: 11, letterSpacing: 2, textTransform: "uppercase" },
-  sticks:    { position: "absolute", bottom: 24, left: 24, right: 24, flexDirection: "row", justifyContent: "space-between", alignItems: "flex-end", zIndex: 20 },
+  // sticks: now handled by DualJoystick component
   overlay:   { ...StyleSheet.absoluteFillObject, backgroundColor: "rgba(0,0,0,0.97)", alignItems: "center", justifyContent: "center", zIndex: 50, padding: 24, gap: 12 },
   ovTitle:   { fontSize: 36, fontWeight: "900", color: "#fff", textTransform: "uppercase" },
   ovMsg:     { fontSize: 13, color: "rgba(255,255,255,0.45)", textAlign: "center", maxWidth: 280 },
