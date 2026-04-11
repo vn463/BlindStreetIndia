@@ -1,0 +1,7 @@
+node_modules/
+android/
+.expo/
+expo-env.d.ts
+*.jks
+*.keystore
+google-service-account.json
